@@ -1,0 +1,466 @@
+---
+title: "Income and Wildfire Risk Analysis"
+author: "Jiayuan Jiang"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: bootstrap
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+###Introduction
+
+This report analyzes the relationship between household income and wildfire risk across California census block groups.
+The goal is to understand whether income level is associated with fire hazard exposure, and how this relationship varies spatially.
+
+We use a dataset that combines
+
+- Median household income from the ***American Community Survey (ACS 2022)***
+
+- Fire Hazard Severity Zones from ***CAL FIRE***
+
+***
+
+###Data Preparation
+```{r}
+pacman::p_load(
+  sf,           # Spatial data processing
+  ggplot2,      # Plotting
+  dplyr,        # Data processing
+  scales,       # Scales and formatting
+  viridis,      # Color mapping
+  ggspatial,    # Add compass and scale bar
+  RColorBrewer, # Color schemes
+  classInt,     # Classification intervals
+  readr,
+  scales,
+  tmap
+)
+# Set working directory (adjust to your path)
+
+setwd("/Users/avalanchy/Downloads/EAS548-648-Geovisiual/lab02")
+
+# Read and clean data
+
+data <- read_csv("census_fire_analysis/census_fire_risk_data.csv", show_col_types = FALSE) %>%
+filter(!is.na(income_clean),!is.na(fire_risk_level),income_clean > 0,!is.na(income_quantile_label)) %>%
+mutate(fire_risk_category = factor(fire_risk_level,levels = 0:3,labels = c("No Risk", "Low Risk", "Moderate Risk", "High Risk")),income_quantile_ordered =factor(income_quantile_label,levels = c("Lowest 20%", "Low 20%", "Middle 20%", "High 20%", "Highest 20%")),income_k = income_clean / 1000)
+
+summary(data)
+```
+
+We clean the dataset by removing missing or invalid values and create two main variables
+
+-`income_quantile_ordered`: categorical income quintiles
+
+-`fire_risk_category`: four fire risk levels (No, Low, Moderate, High)
+
+***
+
+### Geovisualization: Fire Risk Map
+```{r}
+# Census Income Data and Fire Risk Visualization
+pacman::p_load(
+  sf,           # Spatial data processing
+  ggplot2,      # Plotting
+  dplyr,        # Data processing
+  scales,       # Scales and formatting
+  viridis,      # Color mapping
+  ggspatial,    # Add compass and scale bar
+  RColorBrewer, # Color schemes
+  classInt      # Classification intervals
+)
+
+setwd("/Users/avalanchy/Downloads")
+
+# Define main function
+visualize_census_fire_risk <- function(
+    census_file = "/Users/avalanchy/Downloads/FHSZ_SRA_LRA_Combined_-2127032115786874601.geojson",
+    fire_risk_file = "census_with_fire_risk.geojson",
+    income_field = "X19_INCOME_B19013_E001",
+    output_file = "census_fire_risk_map.png",
+    width = 16, 
+    height = 12,
+    dpi = 300
+) {
+  
+  cat("Reading data files...\n")
+  
+  # Read census income data
+  census_data <- st_read(census_file, quiet = TRUE)
+  cat(sprintf("Census data: %d records\n", nrow(census_data)))
+  
+  # Read fire risk data
+  fire_risk_data <- st_read(fire_risk_file, quiet = TRUE)
+  cat(sprintf("Fire risk data: %d records\n", nrow(fire_risk_data)))
+  
+  # Check if income field exists
+  if (!income_field %in% names(census_data)) {
+    cat("Error: Income field does not exist\n")
+    cat("Available fields:\n")
+    print(names(census_data))
+    return(NULL)
+  }
+  
+  # Data preprocessing
+  cat("Preprocessing data...\n")
+  
+  # Process census income data
+  census_clean <- census_data %>%
+    mutate(
+      income = as.numeric(.data[[income_field]]),
+      income_clean = ifelse(income < 0 | is.na(income), NA, income)
+    ) %>%
+    filter(!is.na(income_clean))
+  
+  cat(sprintf("Cleaned Census data: %d records\n", nrow(census_clean)))
+  cat(sprintf("Income statistics: Min=$%s, Max=$%s, Median=$%s\n", 
+              format(min(census_clean$income_clean), big.mark=","),
+              format(max(census_clean$income_clean), big.mark=","),
+              format(median(census_clean$income_clean), big.mark=",")))
+  
+  # Income data quantile classification
+  quantile_breaks <- quantile(census_clean$income_clean, 
+                              probs = c(0, 0.2, 0.4, 0.6, 0.8, 1.0), 
+                              na.rm = TRUE)
+  
+  census_clean <- census_clean %>%
+    mutate(
+      income_quantile = cut(income_clean, 
+                            breaks = quantile_breaks, 
+                            include.lowest = TRUE,
+                            labels = c("Lowest 20%", "Low 20%", "Middle 20%", "High 20%", "Highest 20%"))
+    )
+  
+  # Process fire risk data
+  fire_risk_clean <- fire_risk_data %>%
+    filter(fire_risk_level > 0) %>%  # Only show areas with fire risk
+    mutate(
+      fire_risk_factor = factor(fire_risk_level, 
+                                levels = 1:3,
+                                labels = c("Low Risk", "Moderate Risk", "High Risk"))
+    )
+  
+  cat(sprintf("Areas with fire risk: %d records\n", nrow(fire_risk_clean)))
+  if (nrow(fire_risk_clean) > 0) {
+    print(table(fire_risk_clean$fire_risk_factor))
+  }
+  
+  # Calculate centroids for point display
+  fire_risk_centroids <- fire_risk_clean %>%
+    st_centroid() %>%
+    mutate(
+      point_size = case_when(
+        fire_risk_level == 1 ~ 0.3,
+        fire_risk_level == 2 ~ 1.3,
+        fire_risk_level == 3 ~ 2.0
+      )
+    )
+  
+  # Ensure coordinate systems are consistent
+  if (st_crs(census_clean) != st_crs(fire_risk_centroids)) {
+    fire_risk_centroids <- st_transform(fire_risk_centroids, st_crs(census_clean))
+  }
+  
+  # Create map
+  cat("Creating map...\n")
+  
+  # Define color schemes - using different color families for income and fire risk
+  income_colors <- brewer.pal(5, "Blues")  # Blue gradient for income
+  fire_colors <- c("Low Risk" = "#FED976", "Moderate Risk" = "#FD8D3C", "High Risk" = "#E31A1C")  # Yellow to red for fire risk
+  
+  # Calculate map boundaries
+  bbox <- st_bbox(census_clean)
+  
+  # Create ggplot map
+  p <- ggplot() +
+    # Bottom layer: Census income data (polygons)
+    geom_sf(data = census_clean, 
+            aes(fill = income_quantile),
+            color = "white", 
+            size = 0.05,
+            alpha = 0.8) +
+    
+    # Top layer: Fire risk data (points)
+    geom_sf(data = fire_risk_centroids,
+            aes(color = fire_risk_factor, 
+                size = fire_risk_factor),
+            alpha = 0.5,
+            stroke = 0.3) +
+    
+    # Income color mapping
+    scale_fill_manual(
+      name = "Household Income\nQuantiles",
+      values = income_colors,
+      na.value = "grey95"
+    ) +
+    
+    # Fire risk color and size mapping
+    scale_color_manual(
+      name = "Fire Risk Level",
+      values = fire_colors
+    ) +
+    
+    scale_size_manual(
+      name = "Fire Risk Level",
+      values = c("Low Risk" = 0.8, "Moderate Risk" = 1.5, "High Risk" = 2.5)
+    ) +
+    
+    # Add scale bar only
+    ggspatial::annotation_scale(
+      location = "bl",
+      unit_category = "metric",
+      text_family = "Arial",
+      text_col = "grey30",
+      bar_cols = c("grey60", "white"),
+      line_width = 1,
+      height = unit(0.3, "cm"),
+      text_cex = 0.8
+    ) +
+    
+    # Map styling
+    theme_void() +
+    theme(
+      legend.position = "right",
+      legend.box = "vertical",
+      legend.spacing.y = unit(0.5, "cm"),
+      legend.margin = margin(l = 20),
+      legend.title = element_text(size = 14, face = "bold"),  # Larger legend font
+      legend.text = element_text(size = 12),                  # Larger legend font
+      legend.key.size = unit(0.8, "cm"),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background = element_rect(fill = "white", color = NA),
+      plot.margin = margin(10, 10, 10, 10)
+    ) +
+    
+    # Coordinate system
+    coord_sf(
+      xlim = c(bbox[1], bbox[3]),
+      ylim = c(bbox[2], bbox[4]),
+      expand = FALSE
+    )
+  
+  # Save map
+  cat("Saving map...\n")
+  ggsave(
+    filename = output_file,
+    plot = p,
+    width = width,
+    height = height,
+    dpi = dpi,
+    units = "in",
+    bg = "white"
+  )
+  
+  cat(sprintf("Map saved to: %s\n", output_file))
+  
+  # Display map
+  print(p)
+  
+  # Return statistics
+  stats <- list(
+    census_records = nrow(census_clean),
+    fire_risk_records = nrow(fire_risk_clean),
+    income_summary = summary(census_clean$income_clean),
+    income_quantiles = quantile_breaks,
+    fire_risk_distribution = table(fire_risk_clean$fire_risk_factor)
+  )
+  
+  return(stats)
+}
+
+# Create detailed statistics report function
+print_statistics <- function(stats) {
+  cat("\n=== Data Statistics Report ===\n")
+  cat(sprintf("Census areas processed: %d\n", stats$census_records))
+  cat(sprintf("Areas with fire risk: %d\n", stats$fire_risk_records))
+  
+  cat("\nIncome statistics (USD):\n")
+  income_summary <- stats$income_summary
+  cat(sprintf("  Minimum: $%s\n", format(income_summary[1], big.mark=",")))
+  cat(sprintf("  1st Quartile: $%s\n", format(income_summary[2], big.mark=",")))
+  cat(sprintf("  Median: $%s\n", format(income_summary[3], big.mark=",")))
+  cat(sprintf("  Mean: $%s\n", format(income_summary[4], big.mark=",")))
+  cat(sprintf("  3rd Quartile: $%s\n", format(income_summary[5], big.mark=",")))
+  cat(sprintf("  Maximum: $%s\n", format(income_summary[6], big.mark=",")))
+  
+  cat("\nIncome quantile breakpoints:\n")
+  for (i in 1:length(stats$income_quantiles)) {
+    cat(sprintf("  %d%%: $%s\n", (i-1)*20, format(stats$income_quantiles[i], big.mark=",")))
+  }
+  
+  cat("\nFire risk level distribution:\n")
+  fire_dist <- stats$fire_risk_distribution
+  for (i in 1:length(fire_dist)) {
+    cat(sprintf("  %s: %d areas\n", names(fire_dist)[i], fire_dist[i]))
+  }
+}
+
+# Usage example
+if (TRUE) {  # Set to TRUE to run example
+  
+  # Set file paths
+  census_file <- "/Users/avalanchy/Downloads/MedianIncome.geojson"
+  fire_risk_file <- "/Users/avalanchy/Downloads/EAS548-648-Geovisiual/lab02/census_with_fire_risk.geojson"
+  income_field <- "ACS_2022_5YR_BG_06_CALIFORNIA -X19_INCOME_B19013_E001"  # Adjust based on actual field name
+  
+  census_data <- st_read("/Users/avalanchy/Downloads/MedianIncome.geojson", quiet = TRUE)
+  
+  # Execute visualization
+  tryCatch({
+    result_stats <- visualize_census_fire_risk(
+      census_file = census_file,
+      fire_risk_file = fire_risk_file,
+      income_field = names(census_data)[[52]],
+      output_file = "census_fire_risk_visualization.png",
+      width = 18,  # Increased width for larger map
+      height = 14, # Increased height for larger map
+      dpi = 300
+    )
+    
+    # Print statistics
+    if (!is.null(result_stats)) {
+      print_statistics(result_stats)
+    }
+    
+  }, error = function(e) {
+    cat("Error:", e$message, "\n")
+    cat("Please check:\n")
+    cat("1. File paths are correct\n")
+    cat("2. Field names are correct\n")
+    cat("3. Required R packages are installed\n")
+  })
+}
+
+# Optional: Create simplified version for quick testing
+create_simple_map <- function(census_file, fire_risk_file) {
+  census_data <- st_read(census_file, quiet = TRUE)
+  fire_risk_data <- st_read(fire_risk_file, quiet = TRUE)
+  
+  ggplot() +
+    geom_sf(data = census_data, fill = "lightgray", color = "white", size = 0.1) +
+    geom_sf(data = st_centroid(fire_risk_data %>% filter(fire_risk_level > 0)),
+            aes(color = factor(fire_risk_level)), size = 0.5) +
+    scale_color_manual(values = c("1" = "yellow", "2" = "orange", "3" = "red")) +
+    theme_void()
+}
+```
+This map shows the ***spatial pattern*** of fire risk across California.
+Areas in darker red represent higher fire hazard zones.
+Combining this with income data helps visualize whether wealthier regions overlap with higher-risk areas.
+
+***
+
+### Statistical Relationship: Income vs Fire Risk
+```{r}
+# Scatter plot with loess trend line
+
+data_filtered <- data %>%
+filter(fire_risk_level > 0)
+
+kendall_result <- cor.test(data_filtered$income_clean, data_filtered$fire_risk_level, method = "kendall")
+tau_value <- round(as.numeric(kendall_result$estimate), 4)
+
+p <- ggplot(data_filtered, aes(x = income_k, y = fire_risk_level)) +
+geom_jitter(aes(color = fire_risk_category), alpha = 0.4, size = 1.5) +
+geom_smooth(method = "loess", se = TRUE, color = "#2c3e50", fill = "#3182BD", linewidth = 1.2, alpha = 0.3) +
+scale_color_manual(
+name = "Fire Risk Level",
+values = c("Low Risk" = "#FED976", "Moderate Risk" = "#FD8D3C", "High Risk" = "#E31A1C")
+) +
+scale_x_log10(
+name = "Median Household Income ($1,000s)",
+breaks = c(10, 20, 50, 100, 200, 500),
+labels = function(x) paste0("$", x, "k")
+) +
+scale_y_continuous(
+name = "Fire Risk Level",
+breaks = 1:3,
+labels = c("Low", "Moderate", "High")
+) +
+theme_minimal() +
+labs(
+title = "Relationship Between Income and Fire Risk",
+subtitle = paste0("Kendall's τ = ", tau_value, "  (p = ", signif(kendall_result$p.value, 3), ")")
+)
+
+p
+```
+We use Kendall’s Tau correlation test to quantify the monotonic relationship between income and fire risk.
+
+- ***Kendall’s τ*** = `r tau_value`
+
+- A small positive value suggests that higher income areas tend to have ***slightly higher*** fire risk exposure, likely due to development patterns in suburban–wildland interface zones.
+
+
+***
+
+### Distribution Across Income Groups
+
+```{r}
+plot_data <- data %>%
+group_by(income_quantile_ordered, fire_risk_category) %>%
+summarise(count = n(), .groups = "drop") %>%
+group_by(income_quantile_ordered) %>%
+mutate(
+total = sum(count),
+proportion = count / total,
+percentage = proportion * 100
+)
+
+ggplot(plot_data, aes(x = income_quantile_ordered, y = percentage, fill = fire_risk_category)) +
+geom_col(position = "stack", width = 0.7) +
+geom_text(
+aes(label = ifelse(percentage > 5, paste0(round(percentage, 1), "%"), "")),
+position = position_stack(vjust = 0.5),
+color = "white",
+fontface = "bold"
+) +
+scale_fill_manual(
+name = "Fire Risk Level",
+values = c(
+"No Risk" = "#2E86AB",
+"Low Risk" = "#A23B72",
+"Moderate Risk" = "#F18F01",
+"High Risk" = "#C73E1D"
+)
+) +
+labs(
+title = "Proportion of Fire Risk Levels Across Income Quantiles",
+x = "Household Income Quantile",
+y = "Percentage of Census Block Groups (%)"
+) +
+theme_minimal()
+
+```
+This stacked bar chart shows how fire risk levels distribute across income groups.
+- We can observe that ***high-income block groups*** have a ***slightly higher*** percentage in the "High Risk" category, while lower-income groups are mostly in low-risk zones.
+ ***
+### Discussion
+The analysis indicates a mild positive relationship between income and wildfire risk
+
+- Wealthier households are often located in suburban areas near wildland–urban interfaces (WUI), where fire hazards are greater.
+
+- Lower-income communities, more concentrated in urban centers, face lower wildfire exposure.
+
+This aligns with findings from previous studies that ***environmental risk is not always inversely related to income***; some hazards disproportionately affect affluent regions due to land-use choices.
+
+***
+
+### Conclusion
+Conclusion
+
+- Dataset: ACS 2022 + CAL FIRE FHSZ
+
+- Methods: Kendall’s Tau correlation and proportion visualization
+
+- Main finding: Slight positive association between household income and fire hazard level
+
+- Visualization tools: ggplot2, tmap
+
+This project demonstrates how combining ***statistical analysis*** and ***geospatial visualization*** can uncover nuanced patterns between ***socioeconomic status*** and ***environmental risk***.
